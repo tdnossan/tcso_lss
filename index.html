@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>LiveSplit LSS Analyzer - Data Visualizer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root { --sidebar-width: 300px; --primary-color: #007bff; --gold: #ffd700; --silver: #c0c0c0; --bronze: #cd7f32; }
+        body { font-family: "Segoe UI", sans-serif; margin: 0; display: flex; height: 100vh; background: #f8f9fa; overflow: hidden; }
+        
+        /* サイドバー */
+        #sidebar { width: var(--sidebar-width); background: #fff; border-right: 1px solid #dee2e6; display: flex; flex-direction: column; z-index: 20; }
+        .sidebar-header { padding: 15px; background: #343a40; color: #fff; font-weight: bold; }
+        #segment-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .segment-item { display: flex; align-items: center; padding: 6px; border-bottom: 1px solid #eee; font-size: 0.9em; cursor: pointer; }
+        .segment-item:hover { background: #f1f1f1; }
+
+        /* メインペイン */
+        #main-content { flex: 1; display: flex; flex-direction: column; position: relative; overflow-y: auto; }
+        #drop-zone { 
+            margin: 15px; border: 2px dashed #ccc; background: #fff; 
+            display: flex; align-items: center; justify-content: center;
+            transition: all 0.5s ease; cursor: pointer; min-height: 60px;
+        }
+        #drop-zone.full-screen { position: absolute; inset: 0; margin: 0; z-index: 100; font-size: 1.5em; border-width: 4px; }
+        
+        .toolbar { padding: 0 15px 10px; display: none; justify-content: flex-end; }
+        #table-container { padding: 0 15px 15px; max-height: 400px; overflow-y: auto; }
+        #chart-container { padding: 20px; background: #fff; margin: 0 15px 15px; border: 1px solid #dee2e6; min-height: 400px; }
+        
+        table { border-collapse: collapse; width: 100%; background: #fff; font-size: 0.85em; white-space: nowrap; }
+        th, td { border: 1px solid #dee2e6; padding: 8px 12px; text-align: right; }
+        th { background: #f1f3f5; position: sticky; top: 0; text-align: center; }
+        .top-1 { background-color: #fff9c4 !important; font-weight: bold; }
+        .medal { display: inline-block; width: 16px; height: 16px; border-radius: 50%; margin-right: 5px; 
+                 font-size: 9px; line-height: 16px; text-align: center; color: #fff; vertical-align: middle; }
+        .medal-1 { background: linear-gradient(135deg, var(--gold), #b8860b); }
+        .medal-2 { background: linear-gradient(135deg, var(--silver), #808080); }
+        .medal-3 { background: linear-gradient(135deg, var(--bronze), #8b4513); }
+
+        #toast { 
+            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+            background: #333; color: #fff; padding: 10px 20px; border-radius: 4px;
+            opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+
+    <aside id="sidebar">
+        <div class="sidebar-header" id="txt-sidebar">Segments</div>
+        <div id="segment-list"></div>
+    </aside>
+
+    <main id="main-content">
+        <div id="drop-zone" class="full-screen">Drop .lss file here</div>
+        <input type="file" id="file-input" style="display: none;" accept=".lss">
+        
+        <div class="toolbar" id="toolbar">
+            <button class="btn-copy" id="copy-btn" style="padding: 8px 16px; cursor:pointer;">Copy Table</button>
+        </div>
+
+        <div id="table-container">
+            <table id="result-table">
+                <thead><tr id="table-header"></tr></thead>
+                <tbody id="table-body"></tbody>
+            </table>
+        </div>
+
+        <div id="chart-container">
+            <canvas id="runChart"></canvas>
+        </div>
+    </main>
+
+    <div id="toast">Copied!</div>
+
+    <script>
+        let rawData = { segments: [], runs: [] };
+        let runChart = null;
+        const userLang = navigator.language.startsWith('en') ? 'ja' : 'en';
+        const i18n = {
+            ja: {
+                drop: "ここに .lss ファイルをドロップ",
+                copy: "テーブルをコピー",
+                toast: "コピーしました",
+                id: "ID",
+                date: "日付",
+                tt: "RNG 合計",
+                et: "not RNG 合計",
+                rt: "合計タイム",
+                sb: "集計対象区間"
+            },
+            en: {
+                drop: "Drop .lss file here",
+                copy: "Copy Table",
+                toast: "Copied to clipboard",
+                id: "ID",
+                date: "Date",
+                tt: "RNG Total",
+                et: "not RNG Total",
+                rt: "RealTime",
+                sb: "Target Segments"
+            }
+        };
+        const t = i18n[userLang];
+        const CONFIG = { targetIndexes: [13, 29, 38, 39] }; // deftera, savato, deftera2nd, savato2nd
+
+        // --- 初期化 ---
+        document.getElementById('txt-sidebar').innerText = t.sb;
+        document.getElementById('drop-zone').innerText = t.drop;
+        document.getElementById('copy-btn').innerText = t.copy;
+
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+
+        dropZone.onclick = () => fileInput.click();
+        dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('hover'); };
+        dropZone.ondragleave = () => dropZone.classList.remove('hover');
+        dropZone.ondrop = (e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); };
+        fileInput.onchange = (e) => { if (e.target.files[0]) handleFile(e.target.files[0]); };
+
+        function handleFile(file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                parseLss(e.target.result);
+                dropZone.classList.remove('full-screen');
+                document.getElementById('toolbar').style.display = 'flex';
+                renderSegmentList();
+                updateAnalysis();
+            };
+            reader.readAsText(file);
+        }
+
+        function parseLssTimeToMs(timeStr) {
+            if (!timeStr) return null;
+            const parts = timeStr.split(':');
+            const h = parseInt(parts[0]);
+            const m = parseInt(parts[1]);
+            const sParts = parts[2].split('.');
+            const s = parseInt(sParts[0]);
+            const ms = sParts[1] ? parseInt(sParts[1].substring(0, 3).padEnd(3, '0')) : 0;
+            return (h * 3600000) + (m * 60000) + (s * 1000) + ms;
+        }
+
+        function formatMs(ms, digits = 2) {
+            if (ms === null || ms === undefined) return "-";
+            const d = moment.duration(ms);
+            const hours = Math.floor(d.asHours());
+            const sec = d.seconds() + (d.milliseconds() / 1000);
+            return `${hours}:${String(d.minutes()).padStart(2, '0')}:${sec.toFixed(digits).padStart(digits + 3, '0')}`;
+        }
+
+        function parseLss(xmlText) {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(xmlText, "application/xml");
+            const segmentNodes = doc.querySelectorAll('Segments > Segment');
+            const attemptNodes = doc.querySelectorAll('AttemptHistory > Attempt');
+            
+            rawData.segments = Array.from(segmentNodes).map((s, i) => ({ index: i, name: s.querySelector('Name').textContent }));
+            rawData.runs = Array.from(attemptNodes).filter(a => a.querySelector('RealTime')).map(attempt => {
+                const id = attempt.getAttribute('id');
+                const rtText = attempt.querySelector('RealTime').textContent;
+                const res = {
+                    id,
+                    date: moment(attempt.getAttribute('started'), "MM/DD/YYYY HH:mm:ss").format("YYYY/MM/DD"),
+                    fullRealTime: rtText,
+                    fullRealTimeMs: parseLssTimeToMs(rtText),
+                    segmentMs: {}
+                };
+                segmentNodes.forEach((seg, idx) => {
+                    const tNode = seg.querySelector(`SegmentHistory Time[id="${id}"] RealTime`);
+                    if (tNode) res.segmentMs[idx] = parseLssTimeToMs(tNode.textContent);
+                });
+                return res;
+            });
+        }
+
+        function renderSegmentList() {
+            document.getElementById('segment-list').innerHTML = rawData.segments.map(s => `
+                <label class="segment-item">
+                    <input type="checkbox" value="${s.index}" ${CONFIG.targetIndexes.includes(s.index) ? 'checked' : ''} onchange="updateAnalysis()">
+                    ${s.index}: ${s.name}
+                </label>
+            `).join('');
+        }
+
+        function renderTable(displayRuns, selected, ranks) {
+            const head = document.getElementById('table-header');
+            head.innerHTML = `<th>${t.id}</th><th>${t.date}</th>${selected.map(idx => `<th>${rawData.segments[idx].name}</th>`).join('')}<th>${t.tt}</th><th>${t.et}</th><th>${t.rt}</th>`;
+
+            const createMedal = (val, rankList) => {
+                const idx = rankList.indexOf(val);
+                return idx !== -1 ? `<span class="medal medal-${idx+1}">${idx+1}</span>` : '';
+            };
+
+            document.getElementById('table-body').innerHTML = displayRuns.map(run => {
+                const segCells = selected.map(idx => {
+                    const ms = run.segmentMs[idx];
+                    const medal = createMedal(ms, ranks[`s${idx}`]);
+                    return `<td class="${ranks[`s${idx}`][0]===ms?'top-1':''}" data-full="${formatMs(ms, 7)}">${medal}${formatMs(ms, 2)}</td>`;
+                }).join('');
+
+                const ttMedal = createMedal(run.targetTotal, ranks.tt);
+                const etMedal = createMedal(run.exclTotal, ranks.et);
+                const rtMedal = createMedal(run.fullRealTimeMs, ranks.rt);
+
+                return `<tr>
+                    <td data-full="${run.id}">${run.id}</td><td data-full="${run.date}">${run.date}</td>
+                    ${segCells}
+                    <td class="${ranks.tt[0]===run.targetTotal?'top-1':''}" data-full="${formatMs(run.targetTotal, 7)}">${ttMedal}${formatMs(run.targetTotal, 2)}</td>
+                    <td data-full="${formatMs(run.exclTotal, 7)}">${etMedal}${formatMs(run.exclTotal, 2)}</td>
+                    <td class="${ranks.rt[0]===run.fullRealTimeMs?'top-1':''}" data-full="${run.fullRealTime}">${rtMedal}${run.fullRealTime.split('.')[0]}.${run.fullRealTime.split('.')[1]?.substring(0,2) || '00'}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function updateAnalysis() {
+            const selected = Array.from(document.querySelectorAll('#segment-list input:checked')).map(i => parseInt(i.value));
+            
+            // 1. データの集計
+            const displayRuns = rawData.runs.filter(run => selected.every(idx => run.segmentMs[idx] !== undefined))
+                .map(run => {
+                    let targetTotal = 0, exclTotal = 0;
+                    rawData.segments.forEach(s => {
+                        const ms = run.segmentMs[s.index] || 0;
+                        if (selected.includes(s.index)) targetTotal += ms; 
+                        else exclTotal += ms;
+                    });
+                    return { ...run, targetTotal, exclTotal };
+                });
+
+            // 2. ランキング判定用データの作成
+            const getRankList = (values) => [...new Set(values.filter(v => v > 0))].sort((a, b) => a - b).slice(0, 3);
+
+            const ranks = {
+                tt: getRankList(displayRuns.map(r => r.targetTotal)),
+                et: getRankList(displayRuns.map(r => r.exclTotal)), // 除外合計のランク
+                rt: getRankList(displayRuns.map(r => r.fullRealTimeMs))
+            };
+            selected.forEach(idx => {
+                ranks[`s${idx}`] = getRankList(displayRuns.map(r => r.segmentMs[idx]));
+            });
+
+            const createMedal = (val, rankList) => {
+                const index = rankList.indexOf(val);
+                return index !== -1 ? `<span class="medal medal-${index + 1}">${index + 1}</span>` : '';
+            };
+
+            // 3. テーブル描画
+            const head = document.getElementById('table-header');
+            head.innerHTML = `<th>${t.id}</th>
+            <th>${t.date}</th>
+            ${selected.map(idx => `<th>${rawData.segments[idx].name.split(" ")[0]}</th>`).join('')}
+            <th>${t.tt}</th>
+            <th>${t.et}</th>
+            <th>${t.rt}</th>`;
+
+            document.getElementById('table-body').innerHTML = displayRuns.map(run => {
+                const segCells = selected.map(idx => {
+                    const ms = run.segmentMs[idx];
+                    const medal = createMedal(ms, ranks[`s${idx}`]);
+                    const isGold = ranks[`s${idx}`][0] === ms ? 'top-1' : '';
+                    return `<td class="${isGold}" data-full="${formatMs(ms, 7)}">${medal}${formatMs(ms, 2)}</td>`;
+                }).join('');
+
+                const ttMedal = createMedal(run.targetTotal, ranks.tt);
+                const etMedal = createMedal(run.exclTotal, ranks.et);
+                const rtMedal = createMedal(run.fullRealTimeMs, ranks.rt);
+
+                // 背景色判定用
+                const ttGold = ranks.tt[0] === run.targetTotal ? 'top-1' : '';
+                const etGold = ranks.et[0] === run.exclTotal ? 'top-1' : ''; // 除外合計の1位判定
+                const rtGold = ranks.rt[0] === run.fullRealTimeMs ? 'top-1' : '';
+
+                return `<tr>
+                    <td data-full="${run.id}">${run.id}</td>
+                    <td data-full="${run.date}">${run.date}</td>
+                    ${segCells}
+                    <td class="${ttGold}" data-full="${formatMs(run.targetTotal, 7)}">${ttMedal}${formatMs(run.targetTotal, 2)}</td>
+                    <td class="${etGold}" data-full="${formatMs(run.exclTotal, 7)}">${etMedal}${formatMs(run.exclTotal, 2)}</td>
+                    <td class="${rtGold}" data-full="${run.fullRealTime}">${rtMedal}${run.fullRealTime.split('.')[0]}.${run.fullRealTime.split('.')[1]?.substring(0,2) || '00'}</td>
+                </tr>`;
+            }).join('');
+
+            // 4. グラフ描画
+            renderChart(displayRuns, selected);
+        }
+
+        function renderChart(displayRuns, selected) {
+            const ctx = document.getElementById('runChart').getContext('2d');
+            const labels = displayRuns.map(r => `#${r.id} (${r.date})`);
+            
+            const datasets = [];
+            const colors = ['#f88', '#8f8', '#88f', '#f8f', '#8ff', '#ff8'];
+
+            // 個別区間
+            selected.forEach((idx, i) => {
+                datasets.push({
+                    label: rawData.segments[idx].name.split(" ")[0],
+                    data: displayRuns.map(r => r.segmentMs[idx] / 1000),
+                    borderColor: colors[i % colors.length],
+                    backgroundColor: colors[i % colors.length] + '44',
+                    borderWidth: 1,
+                    tension: 0.2,
+                    hidden: true // 初期状態では個別区間は非表示（見やすくするため）
+                });
+            });
+
+            // 除外合計（グレー）
+            datasets.push({
+                label: t.et,
+                data: displayRuns.map(r => r.exclTotal / 1000),
+                borderColor: '#999',
+                borderWidth: 2,
+                borderDash: [2, 2],
+                tension: 0.1
+            });
+
+            // 対象合計（オレンジ）
+            datasets.push({
+                label: t.tt,
+                data: displayRuns.map(r => r.targetTotal / 1000),
+                borderColor: '#ff9f40',
+                borderWidth: 3,
+                pointRadius: 5,
+                tension: 0.1
+            });
+
+            // RealTime（黒）
+            datasets.push({
+                label: t.rt,
+                data: displayRuns.map(r => r.fullRealTimeMs / 1000),
+                borderColor: '#343a40',
+                borderWidth: 2,
+                borderDash: [5, 5],
+                tension: 0.1
+            });
+
+            if (runChart) runChart.destroy();
+            runChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { 
+                        legend: { position: 'bottom' },
+                        tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.raw.toFixed(2)}s` } }
+                    },
+                    scales: { y: { title: { display: true, text: 'Seconds' } } }
+                }
+            });
+        }
+
+        document.getElementById('copy-btn').onclick = () => {
+            const rows = Array.from(document.querySelectorAll('#result-table tr'));
+            const tsv = rows.map((row, i) => Array.from(row.cells).map(c => i===0 ? c.innerText : (c.getAttribute('data-full') || c.innerText)).join('\t')).join('\n');
+            navigator.clipboard.writeText(tsv).then(() => {
+                const toast = document.getElementById('toast');
+                toast.style.opacity = 1;
+                setTimeout(() => toast.style.opacity = 0, 2000);
+            });
+        };
+    </script>
+</body>
+</html>
